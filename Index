@@ -1,0 +1,353 @@
+-- ZINPLAY: configuração do banco de dados
+
+create extension if not exists pgcrypto;
+
+create table if not exists public.zinplay_profiles (
+  id uuid primary key references auth.users(id) on delete cascade,
+  email text,
+  display_name text not null default 'Criador',
+  role text not null default 'creator'
+    check (role in ('creator','admin')),
+  created_at timestamptz not null default now()
+);
+
+create or replace function public.zinplay_handle_new_user()
+returns trigger
+language plpgsql
+security definer
+set search_path=public
+as $$
+begin
+  insert into public.zinplay_profiles(id,email,display_name,role)
+  values(
+    new.id,
+    new.email,
+    coalesce(
+      new.raw_user_meta_data->>'display_name',
+      split_part(coalesce(new.email,''),'@',1),
+      'Criador'
+    ),
+    case
+      when lower(coalesce(new.email,''))='zhuo16fan@gmail.com'
+      then 'admin'
+      else 'creator'
+    end
+  )
+  on conflict(id) do update set email=excluded.email;
+
+  return new;
+end;
+$$;
+
+drop trigger if exists zinplay_on_auth_user_created on auth.users;
+
+create trigger zinplay_on_auth_user_created
+after insert on auth.users
+for each row
+execute procedure public.zinplay_handle_new_user();
+
+insert into public.zinplay_profiles(id,email,display_name,role)
+select
+  id,
+  email,
+  coalesce(
+    raw_user_meta_data->>'display_name',
+    split_part(coalesce(email,''),'@',1),
+    'Criador'
+  ),
+  case
+    when lower(coalesce(email,''))='zhuo16fan@gmail.com'
+    then 'admin'
+    else 'creator'
+  end
+from auth.users
+on conflict(id) do update set
+  email=excluded.email,
+  role=excluded.role;
+
+create or replace function public.zinplay_is_admin()
+returns boolean
+language sql
+stable
+security definer
+set search_path=public
+as $$
+  select exists(
+    select 1
+    from public.zinplay_profiles
+    where id=auth.uid() and role='admin'
+  );
+$$;
+
+create table if not exists public.zinplay_videos(
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  title text not null,
+  description text not null default '',
+  category text not null default 'Outros',
+  video_path text not null,
+  cover_path text,
+  views_count bigint not null default 0,
+  status text not null default 'published'
+    check(status in ('published','hidden','removed')),
+  created_at timestamptz not null default now()
+);
+
+create table if not exists public.zinplay_likes(
+  video_id uuid not null references public.zinplay_videos(id) on delete cascade,
+  user_id uuid not null references auth.users(id) on delete cascade,
+  created_at timestamptz not null default now(),
+  primary key(video_id,user_id)
+);
+
+create table if not exists public.zinplay_comments(
+  id uuid primary key default gen_random_uuid(),
+  video_id uuid not null references public.zinplay_videos(id) on delete cascade,
+  user_id uuid not null references auth.users(id) on delete cascade,
+  body text not null check(char_length(body) between 1 and 1000),
+  status text not null default 'visible'
+    check(status in ('visible','hidden')),
+  created_at timestamptz not null default now()
+);
+
+create table if not exists public.zinplay_reports(
+  id uuid primary key default gen_random_uuid(),
+  video_id uuid not null references public.zinplay_videos(id) on delete cascade,
+  user_id uuid not null references auth.users(id) on delete cascade,
+  reason text not null,
+  status text not null default 'open'
+    check(status in ('open','reviewed','dismissed')),
+  created_at timestamptz not null default now()
+);
+
+create index if not exists zinplay_feed_idx
+on public.zinplay_videos(status,created_at desc);
+
+create index if not exists zinplay_owner_idx
+on public.zinplay_videos(user_id,created_at desc);
+
+create index if not exists zinplay_comment_idx
+on public.zinplay_comments(video_id,created_at desc);
+
+alter table public.zinplay_profiles enable row level security;
+alter table public.zinplay_videos enable row level security;
+alter table public.zinplay_likes enable row level security;
+alter table public.zinplay_comments enable row level security;
+alter table public.zinplay_reports enable row level security;
+
+drop policy if exists "zinplay profiles read"
+on public.zinplay_profiles;
+
+create policy "zinplay profiles read"
+on public.zinplay_profiles
+for select using(true);
+
+drop policy if exists "zinplay videos read"
+on public.zinplay_videos;
+
+create policy "zinplay videos read"
+on public.zinplay_videos
+for select
+using(
+  status='published'
+  or user_id=auth.uid()
+  or public.zinplay_is_admin()
+);
+
+drop policy if exists "zinplay videos insert"
+on public.zinplay_videos;
+
+create policy "zinplay videos insert"
+on public.zinplay_videos
+for insert
+with check(user_id=auth.uid());
+
+drop policy if exists "zinplay videos update"
+on public.zinplay_videos;
+
+create policy "zinplay videos update"
+on public.zinplay_videos
+for update
+using(user_id=auth.uid() or public.zinplay_is_admin())
+with check(user_id=auth.uid() or public.zinplay_is_admin());
+
+drop policy if exists "zinplay videos delete"
+on public.zinplay_videos;
+
+create policy "zinplay videos delete"
+on public.zinplay_videos
+for delete
+using(user_id=auth.uid() or public.zinplay_is_admin());
+
+drop policy if exists "zinplay likes read"
+on public.zinplay_likes;
+
+create policy "zinplay likes read"
+on public.zinplay_likes
+for select using(true);
+
+drop policy if exists "zinplay likes insert"
+on public.zinplay_likes;
+
+create policy "zinplay likes insert"
+on public.zinplay_likes
+for insert
+with check(user_id=auth.uid());
+
+drop policy if exists "zinplay likes delete"
+on public.zinplay_likes;
+
+create policy "zinplay likes delete"
+on public.zinplay_likes
+for delete
+using(user_id=auth.uid());
+
+drop policy if exists "zinplay comments read"
+on public.zinplay_comments;
+
+create policy "zinplay comments read"
+on public.zinplay_comments
+for select
+using(
+  status='visible'
+  or user_id=auth.uid()
+  or public.zinplay_is_admin()
+);
+
+drop policy if exists "zinplay comments insert"
+on public.zinplay_comments;
+
+create policy "zinplay comments insert"
+on public.zinplay_comments
+for insert
+with check(user_id=auth.uid());
+
+drop policy if exists "zinplay comments delete"
+on public.zinplay_comments;
+
+create policy "zinplay comments delete"
+on public.zinplay_comments
+for delete
+using(user_id=auth.uid() or public.zinplay_is_admin());
+
+drop policy if exists "zinplay reports insert"
+on public.zinplay_reports;
+
+create policy "zinplay reports insert"
+on public.zinplay_reports
+for insert
+with check(user_id=auth.uid());
+
+drop policy if exists "zinplay reports admin read"
+on public.zinplay_reports;
+
+create policy "zinplay reports admin read"
+on public.zinplay_reports
+for select
+using(public.zinplay_is_admin());
+
+drop policy if exists "zinplay reports admin update"
+on public.zinplay_reports;
+
+create policy "zinplay reports admin update"
+on public.zinplay_reports
+for update
+using(public.zinplay_is_admin())
+with check(public.zinplay_is_admin());
+
+create or replace function public.zinplay_increment_views(video_id uuid)
+returns void
+language sql
+security definer
+set search_path=public
+as $$
+  update public.zinplay_videos
+  set views_count=views_count+1
+  where id=video_id and status='published';
+$$;
+
+grant execute on function public.zinplay_increment_views(uuid)
+to anon,authenticated;
+
+-- Armazenamento dos vídeos e capas
+
+insert into storage.buckets(
+  id,
+  name,
+  public,
+  file_size_limit,
+  allowed_mime_types
+)
+values(
+  'zinplay-media',
+  'zinplay-media',
+  true,
+  524288000,
+  array[
+    'video/mp4',
+    'video/webm',
+    'video/quicktime',
+    'video/x-m4v',
+    'image/jpeg',
+    'image/png',
+    'image/webp'
+  ]
+)
+on conflict(id) do update set
+  public=true,
+  file_size_limit=524288000,
+  allowed_mime_types=excluded.allowed_mime_types;
+
+drop policy if exists "zinplay media public read"
+on storage.objects;
+
+create policy "zinplay media public read"
+on storage.objects
+for select
+using(bucket_id='zinplay-media');
+
+drop policy if exists "zinplay media upload own"
+on storage.objects;
+
+create policy "zinplay media upload own"
+on storage.objects
+for insert to authenticated
+with check(
+  bucket_id='zinplay-media'
+  and (storage.foldername(name))[1]=auth.uid()::text
+);
+
+drop policy if exists "zinplay media update own"
+on storage.objects;
+
+create policy "zinplay media update own"
+on storage.objects
+for update to authenticated
+using(
+  bucket_id='zinplay-media'
+  and (
+    (storage.foldername(name))[1]=auth.uid()::text
+    or public.zinplay_is_admin()
+  )
+)
+with check(
+  bucket_id='zinplay-media'
+  and (
+    (storage.foldername(name))[1]=auth.uid()::text
+    or public.zinplay_is_admin()
+  )
+);
+
+drop policy if exists "zinplay media delete own"
+on storage.objects;
+
+create policy "zinplay media delete own"
+on storage.objects
+for delete to authenticated
+using(
+  bucket_id='zinplay-media'
+  and (
+    (storage.foldername(name))[1]=auth.uid()::text
+    or public.zinplay_is_admin()
+  )
+);
